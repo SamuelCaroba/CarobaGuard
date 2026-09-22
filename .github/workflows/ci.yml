@@ -29,4 +29,4 @@ jobs:
         run: |
           node --check web/app.js
           node --check web/chat-recovery.js
-          node --test tests/chat-recovery.test.js
+          node --test tests/*.test.js

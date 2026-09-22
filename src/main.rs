@@ -20,11 +20,15 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Arc::new(Config::from_env()?);
+    #[cfg(unix)]
+    let _runtime_lock = db::lock_runtime(&config)?;
     let db = db::connect(&config).await?;
     db::bootstrap_admin(&db).await?;
 
     let telemetry = TelemetryService::start(db.clone()).await?;
     let opencode = OpenCodeManager::new(db.clone());
+    opencode.recover().await?;
+    let shutdown_manager = opencode.clone();
     let terminal = TerminalService::new(config.terminal_max_sessions);
     let logs = LogService::new(config.log_max_streams);
     let state = AppState {
@@ -48,7 +52,10 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        shutdown_manager.shutdown().await;
+    })
     .await?;
     Ok(())
 }

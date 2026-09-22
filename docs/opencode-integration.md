@@ -34,8 +34,8 @@ Permission flow:
 1. OpenCode emits `permission.asked` or `permission.v2.asked` on its loopback SSE.
 2. CarobaGuard forwards the event to authenticated operators without exposing the
    OpenCode port or credentials.
-3. An operator replies through the CSRF-protected CarobaGuard API.
-4. CarobaGuard relays `once`, `always` or `reject` and records the decision.
+3. An operator replies through the CSRF-protected CarobaGuard API, supplying the local session ID. The backend checks the active workspace, pending request and mode.
+4. CarobaGuard relays only `once` or `reject`. A session grant is kept in memory and never changes global or native saved permissions.
 5. Completed tool parts are audited separately and deduplicated by `callID`,
    including in Unrestricted mode.
 
@@ -53,3 +53,43 @@ Primary references:
 - https://dev.opencode.ai/docs/server/
 - https://dev.opencode.ai/docs/sdk/
 - https://dev.opencode.ai/docs/permissions/
+
+## Browser workspace
+
+The OpenCode page separates session navigation, conversation setup and shared
+process controls. Session mode is always shown beside the conversation title;
+the process warning refers to the running child, not the selected history entry.
+Under **Configurações e processo**, **Mostrar aviso de Unrestricted** controls
+only that warning banner. This browser-local preference uses
+`carobaguard.showUnrestrictedWarning` in localStorage and defaults to visible.
+It does not alter authorization, confirmation requirements or the session badge.
+
+Session search covers title, directory and mode. Unsent drafts are kept separately
+in memory per session and cleared on logout. Escape closes the history/setup
+panel and restores focus; Ctrl/Cmd+Enter sends a message. Panels reflow into the
+document on smaller screens, so they do not require modal focus trapping.
+Permission cards are scoped to the selected remote session and remove resolved
+requests by ID, including when an SSE reply arrives before the HTTP reply.
+
+The history toolbar supports manual reconciliation without reposting prompts.
+Failed prompts can be restored for editing only when the input is empty, preserving
+the current draft. Completed assistant responses can be copied as plain text.
+POST callbacks are tied to their original request object so a late reply cannot
+settle a newer request in the same session after interruption or recovery.
+
+The backend remains authoritative for mode authorization, including resuming
+Unrestricted sessions: the current process mode alone does not reveal the global
+authorization setting. The UI disables actions for known RBAC restrictions and
+reports backend failures without changing the security policy.
+
+Run client regressions with `node --test tests/*.test.js` and syntax checks with
+`node --check web/app.js`. Browser verification should additionally cover all
+three modes, narrow viewports, keyboard focus, errors, and preference persistence.
+
+## Persistent Session Manager
+
+See [the session audit and API contract](session-manager-audit.md) for lifecycle,
+locking, restart recovery, local history, bounded timeline, temporary grants and
+validation commands. Reading offline history no longer starts a Read-Only child.
+The terminal remains an independent administrative PTY; session output comes from
+OpenCode tool messages.

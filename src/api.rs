@@ -65,6 +65,14 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/opencode/sessions/{id}/messages",
             get(opencode::messages).post(opencode::chat),
         )
+        .route(
+            "/api/v1/opencode/sessions/{id}",
+            get(opencode::session_details).delete(opencode::delete_session),
+        )
+        .route(
+            "/api/v1/opencode/sessions/{id}/actions",
+            post(opencode::session_action),
+        )
         .route("/api/v1/opencode/events", get(opencode::events))
         .route(
             "/api/v1/opencode/permissions/{request_id}",

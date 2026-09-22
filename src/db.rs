@@ -101,9 +101,39 @@ pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> anyhow::R
     Ok(())
 }
 
+/// One backend owns a data directory; prevents competing managers after overlapping restarts.
+#[cfg(unix)]
+pub fn lock_runtime(config: &Config) -> anyhow::Result<std::fs::File> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    fs::create_dir_all(&config.data_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(config.data_dir.join("runtime.lock"))?;
+    // SAFETY: flock operates on this live owned descriptor; closing it releases the lock.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        anyhow::bail!("another CarobaGuard backend owns this data directory");
+    }
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn only_one_backend_can_own_a_data_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config::test(temp.path().to_path_buf());
+        let owner = lock_runtime(&config).unwrap();
+        assert!(lock_runtime(&config).is_err());
+        drop(owner);
+        assert!(lock_runtime(&config).is_ok());
+    }
 
     #[tokio::test]
     async fn migrations_create_required_tables() {

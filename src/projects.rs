@@ -451,6 +451,30 @@ fn elapsed_millis(started: Instant) -> i64 {
     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
+/// Bounded read-only Git context, sharing the existing hardened runner.
+pub async fn workspace_git(path: &Path) -> serde_json::Value {
+    match git_command(
+        path,
+        &[
+            "status",
+            "--porcelain=v1",
+            "--branch",
+            "--untracked-files=normal",
+        ],
+    )
+    .await
+    {
+        Ok(output) if output.success => {
+            let mut lines = output.stdout.lines();
+            let branch = lines.next().and_then(parse_branch);
+            let changes: Vec<_> = lines.collect();
+            serde_json::json!({"repository":true,"branch":branch,"clean":changes.is_empty(),"modified_files":changes.len(),"summary":changes.iter().take(200).copied().collect::<Vec<_>>(),"truncated":changes.len()>200})
+        }
+        Ok(_) => serde_json::json!({"repository":false}),
+        Err(error) => serde_json::json!({"repository":null,"error":error.to_string()}),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

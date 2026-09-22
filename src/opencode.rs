@@ -1,5 +1,8 @@
+mod session_manager;
+pub use session_manager::{delete_session, session_action, session_details};
+
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     path::{Path, PathBuf},
     process::Stdio,
@@ -72,7 +75,12 @@ impl AiPermissionMode {
 pub struct OpenCodeManager {
     inner: Arc<Mutex<ProcessState>>,
     start_lock: Arc<Mutex<()>>,
+    transition_lock: Arc<Mutex<()>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
     prompt_lock: Arc<Mutex<()>>,
+    workspace_lock: Arc<Mutex<()>>,
+    approvals: Arc<Mutex<HashSet<(String, String)>>>,
+    pending: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     http: Client,
     events: broadcast::Sender<serde_json::Value>,
     db: SqlitePool,
@@ -81,6 +89,8 @@ pub struct OpenCodeManager {
 
 struct ProcessState {
     phase: AgentPhase,
+    session_id: Option<String>,
+    event_task: Option<tokio::task::AbortHandle>,
     child: Option<Child>,
     connection: Option<Connection>,
     project_path: Option<PathBuf>,
@@ -154,6 +164,7 @@ pub struct ChatRequest {
 pub struct PermissionReplyRequest {
     reply: PermissionReply,
     message: Option<String>,
+    session_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -219,6 +230,10 @@ pub struct AiSession {
     created_at: i64,
     updated_at: i64,
     last_active_at: i64,
+    pid: Option<i64>,
+    project_id: Option<String>,
+    branch: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -234,9 +249,12 @@ pub struct ChatHistoryMessage {
 impl OpenCodeManager {
     pub fn new(db_pool: SqlitePool) -> Self {
         let (events, _) = broadcast::channel(256);
+        let (shutdown, _) = tokio::sync::watch::channel(false);
         let manager = Self {
             inner: Arc::new(Mutex::new(ProcessState {
                 phase: AgentPhase::Sleeping,
+                session_id: None,
+                event_task: None,
                 child: None,
                 connection: None,
                 project_path: None,
@@ -249,7 +267,12 @@ impl OpenCodeManager {
                 error: None,
             })),
             start_lock: Arc::new(Mutex::new(())),
+            transition_lock: Arc::new(Mutex::new(())),
+            shutdown,
             prompt_lock: Arc::new(Mutex::new(())),
+            workspace_lock: Arc::new(Mutex::new(())),
+            approvals: Arc::new(Mutex::new(HashSet::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
             http: Client::builder()
                 .connect_timeout(Duration::from_secs(3))
                 .build()
@@ -310,6 +333,31 @@ impl OpenCodeManager {
         project_path: &Path,
         mode: AiPermissionMode,
     ) -> anyhow::Result<AgentStatus> {
+        let manager = self.clone();
+        let project = project_path.to_path_buf();
+        tokio::spawn(async move {
+            let _transition = manager.transition_lock.lock().await;
+            let result = manager.start_inner(&project, mode).await;
+            if let Err(error) = &result {
+                let mut runtime = manager.inner.lock().await;
+                if matches!(runtime.phase, AgentPhase::Starting) {
+                    let child = detach_child(&mut runtime);
+                    runtime.phase = AgentPhase::Error;
+                    runtime.error = Some(error.to_string());
+                    drop(runtime);
+                    terminate_child(child).await;
+                }
+            }
+            result
+        })
+        .await?
+    }
+
+    async fn start_inner(
+        &self,
+        project_path: &Path,
+        mode: AiPermissionMode,
+    ) -> anyhow::Result<AgentStatus> {
         let _start_guard = self.start_lock.lock().await;
         let project_path = project_path.canonicalize()?;
         anyhow::ensure!(
@@ -350,6 +398,7 @@ impl OpenCodeManager {
             child
         };
         terminate_child(old_child).await;
+        self.sync_sessions().await?;
 
         let mut command = Command::new(&self.binary);
         command
@@ -371,6 +420,25 @@ impl OpenCodeManager {
         if mode != AiPermissionMode::Unrestricted {
             command.arg("--pure");
         }
+        #[cfg(target_os = "linux")]
+        {
+            command.process_group(0);
+            // SAFETY: only async-signal-safe libc calls run between fork and exec.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() == 1 {
+                        return Err(std::io::Error::other("parent exited"));
+                    }
+                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -389,7 +457,13 @@ impl OpenCodeManager {
         state.last_active = Instant::now();
         let generation = state.generation;
         drop(state);
-        let health = wait_for_health(&self.http, &connection).await;
+        self.sync_sessions().await?;
+        let health = tokio::time::timeout(
+            Duration::from_secs(20),
+            wait_for_health(&self.http, &connection),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("OpenCode startup timed out")));
         let version = match health {
             Ok(version) => version,
             Err(error) => {
@@ -427,12 +501,31 @@ impl OpenCodeManager {
     }
 
     pub async fn stop(&self) {
+        let manager = self.clone();
+        let _ = tokio::spawn(async move {
+            let _transition = manager.transition_lock.lock().await;
+            manager.stop_inner().await
+        })
+        .await;
+    }
+
+    pub async fn shutdown(&self) {
+        self.stop().await;
+        let _ = self.shutdown.send(true);
+    }
+
+    async fn stop_inner(&self) {
         let _start_guard = self.start_lock.lock().await;
         let child = {
             let mut state = self.inner.lock().await;
             detach_child(&mut state)
         };
         terminate_child(child).await;
+        self.approvals.lock().await.clear();
+        self.pending.lock().await.clear();
+        if let Err(error) = self.sync_sessions().await {
+            tracing::error!(%error, "session state persistence failed");
+        }
     }
 
     pub async fn request_json(
@@ -441,7 +534,7 @@ impl OpenCodeManager {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> anyhow::Result<serde_json::Value> {
-        let (connection, generation) = {
+        let (connection, generation, directory) = {
             let mut state = self.inner.lock().await;
             refresh_child_status(&mut state);
             anyhow::ensure!(
@@ -453,6 +546,7 @@ impl OpenCodeManager {
             (
                 state.connection.clone().expect("ready connection"),
                 state.generation,
+                state.project_path.as_ref().map(|p| p.display().to_string()),
             )
         };
         let active_request = ActiveRequestGuard::new(self.inner.clone(), generation);
@@ -461,10 +555,17 @@ impl OpenCodeManager {
         } else {
             Duration::from_secs(30)
         };
+        let history_request = method == Method::GET && path.ends_with("/message");
         let mut request = self
             .http
             .request(method, format!("{}{}", connection.base_url, path))
             .basic_auth(&connection.username, Some(&connection.password));
+        if history_request {
+            request = request.query(&[("limit", MAX_CHAT_HISTORY_MESSAGES)]);
+        }
+        if let Some(directory) = directory {
+            request = request.query(&[("directory", directory)]);
+        }
         if let Some(body) = body {
             request = request.json(&body);
         }
@@ -496,6 +597,17 @@ impl OpenCodeManager {
         .await
         .map_err(|_| anyhow::anyhow!("OpenCode request timed out after {request_timeout:?}"))
         .and_then(|result| result);
+        if result.is_err() && path.ends_with("/message") && !history_request {
+            let session_path = path.trim_end_matches("/message");
+            let _ = tokio::time::timeout(
+                Duration::from_secs(3),
+                self.http
+                    .post(format!("{}{session_path}/abort", connection.base_url))
+                    .basic_auth(&connection.username, Some(&connection.password))
+                    .send(),
+            )
+            .await;
+        }
         active_request.finish().await;
         result
     }
@@ -523,7 +635,8 @@ impl OpenCodeManager {
         let events = self.events.clone();
         let db_pool = self.db.clone();
         let inner = self.inner.clone();
-        tokio::spawn(async move {
+        let manager = self.clone();
+        let task = tokio::spawn(async move {
             let mut stream = response.bytes_stream();
             let mut buffer = String::new();
             let mut audited_calls = HashSet::new();
@@ -557,6 +670,10 @@ impl OpenCodeManager {
                             );
                             break 'event_stream;
                         }
+                        if let Err(error) = manager.observe_event(&event).await {
+                            failure_reason = format!("session event persistence failed: {error}");
+                            break 'event_stream;
+                        }
                         let _ = events.send(event);
                     }
                 }
@@ -567,6 +684,7 @@ impl OpenCodeManager {
             let child = {
                 let mut state = inner.lock().await;
                 if state.generation == generation {
+                    state.event_task = None;
                     let child = detach_child(&mut state);
                     state.phase = AgentPhase::Error;
                     state.error = Some(failure_reason);
@@ -576,20 +694,46 @@ impl OpenCodeManager {
                 }
             };
             terminate_child(child).await;
+            let _ = manager.sync_sessions().await;
         });
+        self.inner.lock().await.event_task = Some(task.abort_handle());
         Ok(())
     }
 
     fn spawn_idle_reaper(&self) {
         let manager = self.clone();
+        let mut shutdown = self.shutdown.subscribe();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {},
+                    _ = shutdown.changed() => break,
+                }
+                let _transition = manager.transition_lock.lock().await;
+                let _lifecycle = manager.start_lock.lock().await;
                 let timeout = idle_timeout(&manager.db).await;
+                let connection = {
+                    let runtime = manager.inner.lock().await;
+                    if matches!(runtime.phase, AgentPhase::Ready) {
+                        runtime.connection.clone()
+                    } else {
+                        None
+                    }
+                };
+                let unhealthy = if let Some(connection) = connection {
+                    !matches!(tokio::time::timeout(Duration::from_secs(2), manager.http.get(format!("{}/global/health", connection.base_url)).basic_auth(&connection.username,Some(&connection.password)).send()).await, Ok(Ok(response)) if response.status().is_success())
+                } else {
+                    false
+                };
                 let child = {
                     let mut state = manager.inner.lock().await;
                     refresh_child_status(&mut state);
-                    if matches!(state.phase, AgentPhase::Ready)
+                    if unhealthy {
+                        let child = detach_child(&mut state);
+                        state.phase = AgentPhase::Error;
+                        state.error = Some("OpenCode health check failed".into());
+                        child
+                    } else if matches!(state.phase, AgentPhase::Ready)
                         && state.active_requests == 0
                         && state.last_active.elapsed() >= Duration::from_secs(timeout)
                     {
@@ -600,6 +744,9 @@ impl OpenCodeManager {
                     }
                 };
                 terminate_child(child).await;
+                if let Err(error) = manager.sync_sessions().await {
+                    tracing::error!(%error, "session reconciliation failed");
+                }
             }
         });
     }
@@ -809,7 +956,10 @@ async fn wait_for_health(client: &Client, connection: &Connection) -> anyhow::Re
             .send();
         match tokio::time::timeout(Duration::from_secs(1), request).await {
             Ok(Ok(response)) if response.status().is_success() => {
-                let value: serde_json::Value = response.json().await?;
+                let bytes =
+                    tokio::time::timeout(Duration::from_secs(1), response.bytes()).await??;
+                anyhow::ensure!(bytes.len() <= 65536, "health response too large");
+                let value: serde_json::Value = serde_json::from_slice(&bytes)?;
                 return Ok(value["version"].as_str().unwrap_or("unknown").to_owned());
             }
             Ok(Ok(response)) => last_error = format!("health returned {}", response.status()),
@@ -821,6 +971,9 @@ async fn wait_for_health(client: &Client, connection: &Connection) -> anyhow::Re
 }
 
 fn detach_child(state: &mut ProcessState) -> Option<Child> {
+    if let Some(task) = state.event_task.take() {
+        task.abort();
+    }
     let child = state.child.take();
     state.phase = AgentPhase::Sleeping;
     state.connection = None;
@@ -833,6 +986,13 @@ fn detach_child(state: &mut ProcessState) -> Option<Child> {
 
 async fn terminate_child(child: Option<Child>) {
     if let Some(mut child) = child {
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            // SAFETY: the group is created for this owned child, never a persisted PID.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
         let _ = child.start_kill();
         let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
     }
@@ -848,6 +1008,11 @@ fn refresh_child_status(state: &mut ProcessState) {
             state.error = Some(format!("OpenCode exited with {status}"));
             state.child = None;
             state.connection = None;
+            state.active_requests = 0;
+            state.generation = state.generation.wrapping_add(1);
+            if let Some(task) = state.event_task.take() {
+                task.abort();
+            }
         }
         Ok(None) => {}
         Err(error) => {
@@ -864,7 +1029,7 @@ fn permission_config(mode: AiPermissionMode) -> serde_json::Value {
             "read": {"*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow"},
             "glob": "allow",
             "grep": "allow",
-            "lsp": "allow",
+            "lsp": "deny",
             "question": "allow",
             "edit": "deny",
             "bash": "deny",
@@ -980,7 +1145,24 @@ pub async fn start(
     headers: HeaderMap,
     Json(request): Json<StartRequest>,
 ) -> ApiResult<Json<AgentStatus>> {
+    tokio::spawn(start_request_inner(state, user, headers, request))
+        .await
+        .map_err(ApiError::internal)?
+}
+
+async fn start_request_inner(
+    state: AppState,
+    user: AuthUser,
+    headers: HeaderMap,
+    request: StartRequest,
+) -> ApiResult<Json<AgentStatus>> {
     auth::verify_csrf(&user, &headers)?;
+    let _workspace = state
+        .opencode
+        .workspace_lock
+        .clone()
+        .try_lock_owned()
+        .map_err(|_| ApiError::service_unavailable("workspace is busy"))?;
     let mode = selected_mode(&state.db, request.permission_mode).await;
     ensure_mode_authorized(&user, mode, request.confirmation.as_deref())?;
     let project = request
@@ -989,6 +1171,17 @@ pub async fn start(
         .map(Ok)
         .unwrap_or_else(default_project_path)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let canonical = project
+        .canonicalize()
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let runtime = state.opencode.inner.lock().await;
+    let changing =
+        runtime.project_path.as_deref() != Some(canonical.as_path()) || runtime.mode != mode;
+    drop(runtime);
+    if changing {
+        state.opencode.stop().await;
+        state.opencode.inner.lock().await.session_id = None;
+    }
     let started = Instant::now();
     let result = state.opencode.start(&project, mode).await;
     audit::record(
@@ -1095,9 +1288,14 @@ pub async fn sessions(
     user: AuthUser,
 ) -> ApiResult<Json<Vec<AiSession>>> {
     user.role.require(Role::Operator)?;
+    state
+        .opencode
+        .sync_sessions()
+        .await
+        .map_err(ApiError::internal)?;
     let sessions = sqlx::query_as::<_, AiSession>(
         "SELECT id, opencode_session_id, project_path, title, status, permission_mode, \
-         created_by, created_at, updated_at, last_active_at FROM ai_sessions \
+         created_by, created_at, updated_at, last_active_at, pid, project_id, branch, error FROM ai_sessions \
          ORDER BY last_active_at DESC LIMIT 100",
     )
     .fetch_all(&state.db)
@@ -1112,25 +1310,33 @@ pub async fn messages(
 ) -> ApiResult<Json<Vec<ChatHistoryMessage>>> {
     user.role.require(Role::Operator)?;
     let session = ai_session(&state.db, &id).await?;
-    let status = state.opencode.status().await;
-    if !matches!(status.phase, AgentPhase::Ready) {
-        let project = PathBuf::from(session.project_path.as_deref().unwrap_or("."));
-        state
+    let _workspace = state.opencode.workspace_lock.clone().try_lock_owned().ok();
+    let runtime = state.opencode.inner.lock().await;
+    let online = _workspace.is_some()
+        && runtime.session_id.as_deref() == Some(&id)
+        && matches!(runtime.phase, AgentPhase::Ready);
+    drop(runtime);
+    if online && let Some(remote_id) = session.opencode_session_id.as_deref() {
+        let response = state
             .opencode
-            .start(&project, AiPermissionMode::ReadOnly)
+            .request_json(Method::GET, &format!("/session/{remote_id}/message"), None)
             .await
             .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+        state
+            .opencode
+            .cache_history(&id, &response)
+            .await
+            .map_err(ApiError::internal)?;
     }
-    let remote_id = session
-        .opencode_session_id
-        .as_deref()
-        .ok_or_else(|| ApiError::service_unavailable("AI session has no OpenCode mapping"))?;
-    let response = state
-        .opencode
-        .request_json(Method::GET, &format!("/session/{remote_id}/message"), None)
-        .await
-        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
-    Ok(Json(visible_chat_history(&response)))
+    let payloads: Vec<String> = sqlx::query_scalar("SELECT payload FROM (SELECT payload, message_id FROM ai_messages WHERE session_id=? ORDER BY message_id DESC LIMIT 200) ORDER BY message_id")
+        .bind(&id).fetch_all(&state.db).await?;
+    let history = payloads
+        .iter()
+        .filter_map(|s| serde_json::from_str(s).ok())
+        .collect::<Vec<serde_json::Value>>();
+    Ok(Json(visible_chat_history(&serde_json::Value::Array(
+        history,
+    ))))
 }
 
 pub async fn create_session(
@@ -1148,40 +1354,30 @@ pub async fn create_session(
         .map(Ok)
         .unwrap_or_else(default_project_path)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    state
-        .opencode
-        .start(&project, mode)
-        .await
-        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    let project = project
+        .canonicalize()
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if !project.is_dir() {
+        return Err(ApiError::bad_request("workspace is not a directory"));
+    }
     let title = request
         .title
-        .unwrap_or_else(|| "CarobaGuard investigation".to_owned())
-        .chars()
-        .take(200)
-        .collect::<String>();
-    let remote = state
-        .opencode
-        .request_json(
-            Method::POST,
-            "/session",
-            Some(serde_json::json!({"title": title})),
-        )
-        .await
-        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
-    let opencode_id = remote["id"]
-        .as_str()
-        .ok_or_else(|| ApiError::service_unavailable("OpenCode returned no session ID"))?;
+        .unwrap_or_else(|| "CarobaGuard investigation".to_owned());
+    let title = title.trim();
+    if title.is_empty() || title.len() > 200 || title.chars().any(char::is_control) {
+        return Err(ApiError::bad_request("invalid session name"));
+    }
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
     sqlx::query(
         "INSERT INTO ai_sessions(id, opencode_session_id, project_path, title, status, \
          permission_mode, created_by, created_at, updated_at, last_active_at) \
-         VALUES(?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?)",
+         VALUES(?, ?, ?, ?, 'created', ?, ?, ?, ?, ?)",
     )
     .bind(&id)
-    .bind(opencode_id)
+    .bind(Option::<String>::None)
     .bind(project.display().to_string())
-    .bind(&title)
+    .bind(title)
     .bind(mode.as_str())
     .bind(&user.id)
     .bind(now)
@@ -1189,9 +1385,17 @@ pub async fn create_session(
     .bind(now)
     .execute(&state.db)
     .await?;
+    sqlx::query("UPDATE ai_sessions SET project_id=(SELECT id FROM projects WHERE path=? LIMIT 1) WHERE id=?")
+        .bind(project.display().to_string()).bind(&id).execute(&state.db).await?;
+    let git = crate::projects::workspace_git(&project).await;
+    sqlx::query("UPDATE ai_sessions SET branch=? WHERE id=?")
+        .bind(git["branch"].as_str())
+        .bind(&id)
+        .execute(&state.db)
+        .await?;
     let session = sqlx::query_as::<_, AiSession>(
         "SELECT id, opencode_session_id, project_path, title, status, permission_mode, \
-         created_by, created_at, updated_at, last_active_at FROM ai_sessions WHERE id = ?",
+         created_by, created_at, updated_at, last_active_at, pid, project_id, branch, error FROM ai_sessions WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&state.db)
@@ -1202,7 +1406,7 @@ pub async fn create_session(
             actor_user_id: Some(&user.id),
             actor_name: &user.username,
             origin: "manual",
-            action: "opencode.session.create",
+            action: "session.created",
             target: &session.id,
             command: None,
             result: "success",
@@ -1225,6 +1429,24 @@ pub async fn chat(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<ChatRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    tokio::spawn(chat_inner(state, user, headers, id, request))
+        .await
+        .map_err(ApiError::internal)?
+}
+
+async fn chat_inner(
+    state: AppState,
+    user: AuthUser,
+    headers: HeaderMap,
+    id: String,
+    request: ChatRequest,
+) -> ApiResult<Json<serde_json::Value>> {
+    let _workspace = state
+        .opencode
+        .workspace_lock
+        .clone()
+        .try_lock_owned()
+        .map_err(|_| ApiError::service_unavailable("workspace is busy"))?;
     user.role.require(Role::Operator)?;
     auth::verify_csrf(&user, &headers)?;
     if request.message.trim().is_empty() || request.message.len() > 32_000 {
@@ -1252,12 +1474,12 @@ pub async fn chat(
             ));
         }
     }
-    let project = PathBuf::from(session.project_path.as_deref().unwrap_or("."));
     state
         .opencode
-        .start(&project, mode)
+        .wake(&session)
         .await
-        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+        .map_err(|e| ApiError::service_unavailable(e.to_string()))?;
+    let session = ai_session(&state.db, &id).await?;
     let context = build_context(&state, request.context.as_ref()).await;
     let prompt = format!(
         "<carobaguard_context>\n{}\n</carobaguard_context>\n\n<user_request>\n{}\n</user_request>",
@@ -1280,6 +1502,17 @@ pub async fn chat(
             })),
         )
         .await;
+    if let Ok(history) = state
+        .opencode
+        .request_json(Method::GET, &format!("/session/{remote_id}/message"), None)
+        .await
+    {
+        state
+            .opencode
+            .cache_history(&id, &history)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     audit::record(
         &state.db,
         NewAuditEvent {
@@ -1308,7 +1541,7 @@ pub async fn chat(
     .map_err(ApiError::internal)?;
     let response = response.map_err(|error| ApiError::service_unavailable(error.to_string()))?;
     sqlx::query(
-        "UPDATE ai_sessions SET status = 'ready', updated_at = unixepoch(), \
+        "UPDATE ai_sessions SET updated_at = unixepoch(), \
          last_active_at = unixepoch() WHERE id = ?",
     )
     .bind(&id)
@@ -1323,7 +1556,7 @@ async fn ai_session(pool: &SqlitePool, id: &str) -> ApiResult<AiSession> {
     }
     sqlx::query_as::<_, AiSession>(
         "SELECT id, opencode_session_id, project_path, title, status, permission_mode, \
-         created_by, created_at, updated_at, last_active_at FROM ai_sessions WHERE id = ?",
+         created_by, created_at, updated_at, last_active_at, pid, project_id, branch, error FROM ai_sessions WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -1400,44 +1633,15 @@ pub async fn reply_permission(
 ) -> ApiResult<Json<serde_json::Value>> {
     user.role.require(Role::Operator)?;
     auth::verify_csrf(&user, &headers)?;
-    if !request_id.starts_with("per")
-        || request_id.len() > 128
-        || !request_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
-        return Err(ApiError::bad_request("invalid OpenCode permission ID"));
+    validate_remote_id(&request_id, "per", "permission")?;
+    let session = ai_session(&state.db, &request.session_id).await?;
+    if session.permission_mode == "unrestricted" {
+        user.role.require(Role::Admin)?;
     }
-    let reply = request.reply.as_str();
-    let response = state
-        .opencode
-        .request_json(
-            Method::POST,
-            &format!("/permission/{request_id}/reply"),
-            Some(serde_json::json!({"reply": reply, "message": request.message})),
-        )
-        .await
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    audit::record(
-        &state.db,
-        NewAuditEvent {
-            actor_user_id: Some(&user.id),
-            actor_name: &user.username,
-            origin: "opencode",
-            action: "opencode.permission.reply",
-            target: &request_id,
-            command: None,
-            result: reply,
-            duration_ms: 0,
-            exit_code: Some(0),
-            ai_session_id: None,
-            ai_permission_mode: Some("approval"),
-            metadata: serde_json::json!({}),
-        },
-    )
-    .await
-    .map_err(ApiError::internal)?;
-    Ok(Json(response))
+    Ok(Json(
+        session_manager::permission_decision(&state.opencode, &session, &request_id, &request)
+            .await?,
+    ))
 }
 
 pub async fn questions(
@@ -1730,9 +1934,14 @@ pub async fn events(
 ) -> ApiResult<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>> {
     user.role.require(Role::Operator)?;
     let mut receiver = state.opencode.subscribe();
+    let mut shutdown = state.opencode.shutdown.subscribe();
     let stream = async_stream::stream! {
         loop {
-            match receiver.recv().await {
+            let received = tokio::select! {
+                value = receiver.recv() => value,
+                _ = shutdown.changed() => break,
+            };
+            match received {
                 Ok(value) => {
                     let event_type = value["type"].as_str().unwrap_or("opencode");
                     if let Ok(data) = serde_json::to_string(&value) {

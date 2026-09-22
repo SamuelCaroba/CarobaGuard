@@ -334,6 +334,7 @@ async fn run_session(
 
     send_server_message(&mut socket, &ServerMessage::Exit { reason, exit_code }).await;
     drop(input_tx);
+    drop(output_rx); // Unblock PTY workers even when the output queue was full.
     cleanup_child(terminal.master, terminal.child).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), writer_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), reader_task).await;
@@ -768,6 +769,19 @@ mod tests {
         assert!(installer.contains("KillMode=control-group"));
         assert!(installer.contains("PrivateTmp=true"));
         assert!(installer.contains("UMask=0077"));
+    }
+
+    #[tokio::test]
+    async fn disconnect_unblocks_a_full_pty_output_queue() {
+        let (sender, receiver) = mpsc::channel(1);
+        let reader = std::io::Cursor::new(vec![b'x'; 32768]);
+        let worker = tokio::task::spawn_blocking(move || read_pty(Box::new(reader), sender));
+        tokio::task::yield_now().await;
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
