@@ -918,21 +918,16 @@ function renderAiSessions(sessions) {
     const open = document.createElement("button");
     open.type = "button";
     open.className = "secondary";
-    open.textContent = "Abrir";
-    open.addEventListener("click", () => { void selectAiSession(session); });
-    const wake = document.createElement("button");
-    wake.type = "button";
-    wake.className = "primary compact-button";
-    wake.textContent = "Acordar";
-    wake.disabled = session.status === "archived" || (session.permission_mode === "unrestricted" && state.user?.role !== "admin");
-    wake.addEventListener("click", () => { void wakeAiSession(session); });
+    open.textContent = session.status === "archived" ? "Ver histórico" : "Abrir sessão";
+    open.disabled = session.permission_mode === "unrestricted" && state.user?.role !== "admin";
+    open.addEventListener("click", () => wakeAiSession(session));
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "secondary";
     remove.textContent = "Excluir";
     remove.disabled = session.permission_mode === "unrestricted" && state.user?.role !== "admin";
     remove.addEventListener("click", () => { void sessionOperation("delete", null, session); });
-    actions.append(open, wake, remove);
+    actions.append(open, remove);
     card.append(title, project, meta, actions);
     return card;
   });
@@ -953,12 +948,12 @@ function setAiSetup(open) {
 function setAiSessionsDrawer(open, focus = true) {
   if (open && (state.aiResponding || state.aiCreating || state.aiSelecting || state.aiManualSync || !canOperateAi())) return;
   $("ai-session-drawer").hidden = !open;
-  $("ai-sessions-toggle").setAttribute("aria-expanded", String(open));
+  $("wake-ai").setAttribute("aria-expanded", String(open));
   if (open) {
     setAiSetup(false);
     renderAiSessions(state.aiSessions);
     if (focus) $("ai-session-search").focus();
-  } else if (focus) $("ai-sessions-toggle").focus();
+  } else if (focus) $("wake-ai").focus();
 }
 
 function canOperateAi() { return ["admin", "operator"].includes(state.user?.role); }
@@ -1012,11 +1007,10 @@ function updateAiConversation() {
   $("wake-ai").disabled = busy || !canOperateAi() || state.aiInstalled === false;
   $("wake-ai").textContent = state.sessionPendingAction === "resume" ? "Acordando…" : "Acordar";
   $("start-ai").disabled = busy || !canOperateAi() || state.aiInstalled === false;
-  $("ai-sessions-toggle").disabled = busy || !canOperateAi();
   $("ai-sessions").querySelectorAll(".session-card").forEach((card) => {
     const restricted = card.dataset.mode === "unrestricted" && state.user?.role !== "admin";
     card.querySelectorAll("button").forEach((button) => {
-      button.disabled = busy || !canOperateAi() || ((button.textContent === "Acordar" && card.dataset.status === "archived") || (button.textContent !== "Abrir" && restricted));
+      button.disabled = busy || !canOperateAi() || restricted;
     });
   });
   $("retry-ai").disabled = busy;
@@ -1175,7 +1169,9 @@ async function wakeAi() {
 async function wakeAiSession(session) {
   if (state.sessionOperationPending || state.aiSelecting || state.aiResponding) return;
   if (state.aiSession?.id !== session.id) await selectAiSession(session);
-  if (state.aiSession?.id === session.id) await sessionOperation("resume");
+  else setAiSessionsDrawer(false, false);
+  if (state.aiSession?.id === session.id && state.aiSession.status !== "archived"
+      && (state.aiSession.status !== "ready" || state.aiPhase !== "ready")) await sessionOperation("resume");
 }
 
 async function stopAi() {
@@ -1844,7 +1840,6 @@ $("page-ai").addEventListener("keydown", (event) => {
   if (!$("ai-setup").hidden) { setAiSetup(false); $("start-ai").focus(); }
   else if (!$("ai-session-drawer").hidden) setAiSessionsDrawer(false);
 });
-$("ai-sessions-toggle").addEventListener("click", () => setAiSessionsDrawer($("ai-session-drawer").hidden));
 $("close-ai-sessions").addEventListener("click", () => setAiSessionsDrawer(false));
 $("chat-form").addEventListener("submit", sendChat);
 $("question-card").addEventListener("submit", (event) => {
@@ -1941,7 +1936,7 @@ async function sessionOperation(action, title = null, target = null) {
   finally { state.sessionOperationPending = false; state.sessionPendingAction = null; updateAiConversation(); }
 }
 
-for (const action of ["resume", "sleep", "stop", "archive", "delete"]) {
+for (const action of ["sleep", "stop", "archive", "delete"]) {
   $(`session-${action}`).addEventListener("click", () => { void sessionOperation(action); });
 }
 $("session-refresh").addEventListener("click", () => { void loadSessionWorkspace(); });

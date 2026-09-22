@@ -78,7 +78,7 @@ test("status refresh does not overwrite the project being configured", () => {
   assert.equal(elements["ai-project"].value, "/srv/new-project");
 });
 
-test("wake button opens sessions; waking one session prevents duplicate requests", async () => {
+test("the single wake button opens sessions; opening one wakes it once", async () => {
   const { run, elements } = client();
   run(`
     state.aiSession = { id: "session-a", title: "Investigação", status: "sleeping", permission_mode: "read_only", project_path: "/srv", last_active_at: 1 };
@@ -102,9 +102,12 @@ test("wake button opens sessions; waking one session prevents duplicate requests
   await elements["wake-ai"].listeners.click();
   assert.equal(elements["ai-session-drawer"].hidden, false);
   assert.equal(run("wakePosts"), 0);
-  const wake = run("wakeAiSession(state.aiSession)");
+  const actions = elements["ai-sessions"].children[0].children[3].children;
+  assert.deepEqual(actions.map((button) => button.textContent), ["Abrir sessão", "Excluir"]);
+  const wake = actions[0].listeners.click();
   await Promise.resolve();
   assert.equal(run("wakePosts"), 1);
+  assert.equal(elements["ai-session-drawer"].hidden, true);
   assert.equal(run("wakeBody.action"), "resume");
   assert.equal(elements["wake-ai"].disabled, true);
   assert.equal(elements["wake-ai"].textContent, "Acordando…");
