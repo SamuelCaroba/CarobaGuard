@@ -59,6 +59,8 @@ Primary references:
 The OpenCode page separates session navigation, conversation setup and shared
 process controls. Session mode is always shown beside the conversation title;
 the process warning refers to the running child, not the selected history entry.
+The top-bar **Acordar OpenCode** button resumes the selected session. If no session
+is selected, it opens the session list or the setup for a first conversation.
 Under **Configurações e processo**, **Mostrar aviso de Unrestricted** controls
 only that warning banner. This browser-local preference uses
 `carobaguard.showUnrestrictedWarning` in localStorage and defaults to visible.

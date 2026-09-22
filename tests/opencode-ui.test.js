@@ -78,6 +78,41 @@ test("status refresh does not overwrite the project being configured", () => {
   assert.equal(elements["ai-project"].value, "/srv/new-project");
 });
 
+test("wake button resumes the selected session and prevents duplicate requests", async () => {
+  const { run, elements } = client();
+  run(`
+    state.aiSession = { id: "session-a", title: "Investigação", status: "sleeping", permission_mode: "read_only", project_path: "/srv", last_active_at: 1 };
+    state.aiSessions = [state.aiSession];
+    state.aiPhase = "sleeping";
+    globalThis.wakePosts = 0;
+    request = async (path, options) => {
+      if (path.endsWith("/actions")) {
+        wakePosts++;
+        globalThis.wakeBody = JSON.parse(options.body);
+        return new Promise((resolve) => { globalThis.finishWake = resolve; });
+      }
+      if (path.endsWith("/sessions")) return [state.aiSession];
+      if (path.endsWith("/status")) return { installed: true, phase: "ready", permission_mode: "read_only", memory_bytes: 1, idle_timeout_seconds: 600 };
+      throw new Error(path);
+    };
+    loadSessionWorkspace = async () => {};
+    reconcileAiHistory = async () => {};
+    updateAiConversation();
+  `);
+  const wake = elements["wake-ai"].listeners.click();
+  await Promise.resolve();
+  assert.equal(run("wakePosts"), 1);
+  assert.equal(run("wakeBody.action"), "resume");
+  assert.equal(elements["wake-ai"].disabled, true);
+  assert.equal(elements["wake-ai"].textContent, "Acordando…");
+  await elements["wake-ai"].listeners.click();
+  assert.equal(run("wakePosts"), 1);
+  run('finishWake({ ...state.aiSession, status: "ready" })');
+  await wake;
+  assert.equal(elements["wake-ai"].textContent, "OpenCode acordado");
+  assert.equal(run("state.aiSession.status"), "ready");
+});
+
 test("permissions from another session cannot be shown or approved", async () => {
   const { run, elements } = client();
   run('state.aiSession = { id: "a", opencode_session_id: "remote-a", permission_mode: "approval" }; state.pendingPermissions = [{ id: "per_b", sessionID: "remote-b" }]; request = () => { throw new Error("must not send"); }; renderPendingPermission();');
