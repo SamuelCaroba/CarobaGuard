@@ -401,6 +401,13 @@ dialog::backdrop { background: rgba(2,5,7,.78); backdrop-filter: blur(3px); }
 .session-columns { font-size: 10px; color: var(--muted, #9aa4ae); }
 
 .ai-session-drawer { width: min(900px, 100%); max-width: 100%; }
-.session-item { display: grid; grid-template-columns: 1.1fr 1.6fr .7fr .8fr 1.2fr; gap: 10px; align-items: center; }
-.session-item > * { min-width: 0; overflow-wrap: anywhere; }
-@media (max-width: 640px) { .session-item { grid-template-columns: 1fr 1fr; } .session-item > strong { grid-column: 1 / -1; } }
+.session-list-hint { color: #a4b3be; font-size: 12px; line-height: 1.5; }
+.session-card { padding: 12px; border: 1px solid var(--line); background: var(--surface); }
+.session-card + .session-card { margin-top: 8px; }
+.session-card.active { border-color: var(--green); }
+.session-card strong, .session-card small { display: block; overflow-wrap: anywhere; }
+.session-card strong { font-size: 13px; }
+.session-card small { margin-top: 4px; color: #a4b3be; font-size: 11px; }
+.session-card-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+.session-card-actions button { min-height: 32px; }
+#ai-unrestricted-auto-label { flex: 1 1 310px; max-width: 620px; margin-top: 0; padding: 9px 12px; border: 1px solid rgba(255,109,120,.35); background: rgba(255,109,120,.05); }

@@ -78,7 +78,7 @@ test("status refresh does not overwrite the project being configured", () => {
   assert.equal(elements["ai-project"].value, "/srv/new-project");
 });
 
-test("wake button resumes the selected session and prevents duplicate requests", async () => {
+test("wake button opens sessions; waking one session prevents duplicate requests", async () => {
   const { run, elements } = client();
   run(`
     state.aiSession = { id: "session-a", title: "Investigação", status: "sleeping", permission_mode: "read_only", project_path: "/srv", last_active_at: 1 };
@@ -99,18 +99,60 @@ test("wake button resumes the selected session and prevents duplicate requests",
     reconcileAiHistory = async () => {};
     updateAiConversation();
   `);
-  const wake = elements["wake-ai"].listeners.click();
+  await elements["wake-ai"].listeners.click();
+  assert.equal(elements["ai-session-drawer"].hidden, false);
+  assert.equal(run("wakePosts"), 0);
+  const wake = run("wakeAiSession(state.aiSession)");
   await Promise.resolve();
   assert.equal(run("wakePosts"), 1);
   assert.equal(run("wakeBody.action"), "resume");
   assert.equal(elements["wake-ai"].disabled, true);
   assert.equal(elements["wake-ai"].textContent, "Acordando…");
-  await elements["wake-ai"].listeners.click();
+  await run("wakeAiSession(state.aiSession)");
   assert.equal(run("wakePosts"), 1);
   run('finishWake({ ...state.aiSession, status: "ready" })');
   await wake;
-  assert.equal(elements["wake-ai"].textContent, "OpenCode acordado");
+  assert.equal(elements["wake-ai"].textContent, "Acordar");
   assert.equal(run("state.aiSession.status"), "ready");
+});
+
+test("Unrestricted asks each time when off and auto-confirms when enabled", async () => {
+  const { run, elements, storage } = client();
+  run('state.user.id = "admin-1";');
+  let prompts = 0;
+  run('window.prompt = () => { globalThis.prompts = (globalThis.prompts || 0) + 1; return "I understand OpenCode will have full control"; };');
+  await run('confirmationFor("unrestricted")');
+  await run('confirmationFor("unrestricted")');
+  prompts = run('globalThis.prompts');
+  assert.equal(prompts, 2);
+  elements["ai-unrestricted-auto-confirm"].checked = true;
+  elements["ai-unrestricted-auto-confirm"].listeners.change({ target: elements["ai-unrestricted-auto-confirm"] });
+  assert.equal(storage.get("carobaguard.unrestrictedAutoConfirm.admin-1"), "true");
+  assert.equal(await run('confirmationFor("unrestricted")'), "I understand OpenCode will have full control");
+  assert.equal(run('globalThis.prompts'), 2);
+  elements["ai-unrestricted-auto-confirm"].checked = false;
+  elements["ai-unrestricted-auto-confirm"].listeners.change({ target: elements["ai-unrestricted-auto-confirm"] });
+  await run('confirmationFor("unrestricted")');
+  assert.equal(run('globalThis.prompts'), 3);
+});
+
+test("deleting an active session stops it first and keeps another selected conversation", async () => {
+  const { run } = client();
+  run(`
+    state.aiSession = { id: "keep", title: "Atual", status: "sleeping", permission_mode: "read_only" };
+    globalThis.toDelete = { id: "remove", title: "Antiga", status: "ready", permission_mode: "read_only" };
+    globalThis.operations = [];
+    request = async (url, options) => {
+      if (options?.method === "POST") { operations.push("stop"); return {}; }
+      if (options?.method === "DELETE") { operations.push("delete"); return {}; }
+      if (url.endsWith("/sessions")) return [state.aiSession];
+      if (url.endsWith("/status")) return { installed: true, phase: "sleeping", permission_mode: "read_only", memory_bytes: 0, idle_timeout_seconds: 600 };
+      throw new Error(url);
+    };
+  `);
+  await run('sessionOperation("delete", null, toDelete)');
+  assert.equal(run('operations.join(",")'), "stop,delete");
+  assert.equal(run('state.aiSession.id'), "keep");
 });
 
 test("permissions from another session cannot be shown or approved", async () => {

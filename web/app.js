@@ -37,7 +37,7 @@ const state = {
   pendingPermissions: [],
   pendingQuestions: [],
   questionRefreshPending: false,
-  unrestrictedConfirmed: false,
+  unrestrictedAutoConfirm: false,
   logStream: null,
   logLines: [],
   logPaused: false,
@@ -73,6 +73,9 @@ function showLogin() {
 function showApp(session) {
   state.user = session.user;
   state.csrf = session.csrf_token;
+  state.unrestrictedAutoConfirm = false;
+  try { state.unrestrictedAutoConfirm = localStorage.getItem(`carobaguard.unrestrictedAutoConfirm.${session.user.id}`) === "true"; }
+  catch (_) { /* A confirmação continua manual quando o armazenamento não está disponível. */ }
   $("login-view").hidden = true;
   $("app").hidden = false;
   $("user-name").textContent = session.user.username;
@@ -127,7 +130,7 @@ $("logout").addEventListener("click", async () => {
   clearPendingPermissions();
   state.pendingQuestions = [];
   renderPendingQuestion();
-  state.unrestrictedConfirmed = false;
+  state.unrestrictedAutoConfirm = false;
   state.csrf = "";
   state.user = null;
   showLogin();
@@ -899,27 +902,41 @@ function renderAiSessions(sessions) {
     $("ai-sessions").replaceChildren(empty);
     return;
   }
-  const buttons = visible.map((session) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `session-item${state.aiSession && state.aiSession.id === session.id ? " active" : ""}`;
-    if (session.id === state.aiSession?.id) button.setAttribute("aria-current", "true");
-    button.disabled = state.aiResponding || state.aiLoading || state.aiCreating || state.aiSelecting || state.aiStopping;
+  const cards = visible.map((session) => {
+    const card = document.createElement("div");
+    card.className = `session-card${state.aiSession?.id === session.id ? " active" : ""}`;
+    card.dataset.mode = session.permission_mode;
+    card.dataset.status = session.status;
     const title = document.createElement("strong");
     title.textContent = session.title;
     const project = document.createElement("small");
     project.textContent = session.project_path || "Diretório padrão";
-    const phase = document.createElement("small");
-    phase.textContent = session.status || "sleeping";
-    const mode = document.createElement("small");
-    mode.textContent = modeLabel(session.permission_mode);
-    const active = document.createElement("small");
-    active.textContent = new Date(session.last_active_at * 1000).toLocaleString();
-    button.append(title, project, phase, mode, active);
-    button.addEventListener("click", () => { selectAiSession(session); });
-    return button;
+    const meta = document.createElement("small");
+    meta.textContent = `${session.status || "sleeping"} · ${modeLabel(session.permission_mode)} · ${new Date(session.last_active_at * 1000).toLocaleString()}`;
+    const actions = document.createElement("div");
+    actions.className = "session-card-actions";
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "secondary";
+    open.textContent = "Abrir";
+    open.addEventListener("click", () => { void selectAiSession(session); });
+    const wake = document.createElement("button");
+    wake.type = "button";
+    wake.className = "primary compact-button";
+    wake.textContent = "Acordar";
+    wake.disabled = session.status === "archived" || (session.permission_mode === "unrestricted" && state.user?.role !== "admin");
+    wake.addEventListener("click", () => { void wakeAiSession(session); });
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "secondary";
+    remove.textContent = "Excluir";
+    remove.disabled = session.permission_mode === "unrestricted" && state.user?.role !== "admin";
+    remove.addEventListener("click", () => { void sessionOperation("delete", null, session); });
+    actions.append(open, wake, remove);
+    card.append(title, project, meta, actions);
+    return card;
   });
-  $("ai-sessions").replaceChildren(...buttons);
+  $("ai-sessions").replaceChildren(...cards);
 }
 
 function setAiSetup(open) {
@@ -962,6 +979,8 @@ function saveAiDraft() {
 
 function updateAiConversation() {
   const session = state.aiSession;
+  $("ai-unrestricted-auto-label").hidden = state.user?.role !== "admin";
+  $("ai-unrestricted-auto-confirm").checked = state.unrestrictedAutoConfirm;
   $("ai-session-title").textContent = session ? session.title : "Nenhuma sessão selecionada";
   $("ai-session-meta").textContent = session
     ? session.project_path || "Diretório padrão"
@@ -972,7 +991,7 @@ function updateAiConversation() {
   $("ai-mode-description").textContent = mode === "read_only"
     ? "Somente inspeção. Ferramentas de alteração e comandos são bloqueados."
     : mode === "approval" ? "Alterações solicitam sua autorização nesta conversa antes de executar."
-    : mode === "unrestricted" ? "Execução direta, sem aprovação por ação, limitada aos privilégios da conta Linux. Ao retomar, o servidor verifica se o modo irrestrito continua autorizado."
+    : mode === "unrestricted" ? "Execução direta, sem aprovação por ação, limitada aos privilégios da conta Linux. A confirmação ao iniciar ou retomar depende da opção acima."
     : "Escolha uma conversa para ver seu modo de segurança.";
   const restriction = !canOperateAi() ? "OpenCode exige perfil Operator ou Admin."
     : state.aiInstalled === false ? "OpenCode não está instalado no servidor. Instale e configure o provedor para iniciar."
@@ -990,14 +1009,16 @@ function updateAiConversation() {
   $("chat-prompt").disabled = disabled;
   $("chat-form").querySelector("button[type=submit]").disabled = disabled || !promptBytes || promptBytes > 32000;
   const busy = state.aiResponding || state.aiLoading || state.aiCreating || state.aiSelecting || state.aiManualSync || state.aiStopping || state.sessionOperationPending;
-  $("wake-ai").disabled = busy || !canOperateAi() || state.aiInstalled === false
-    || session?.status === "archived" || (mode === "unrestricted" && state.user?.role !== "admin")
-    || (session?.status === "ready" && state.aiPhase === "ready");
-  $("wake-ai").textContent = state.sessionPendingAction === "resume" ? "Acordando…"
-    : session?.status === "ready" && state.aiPhase === "ready" ? "OpenCode acordado" : "Acordar OpenCode";
+  $("wake-ai").disabled = busy || !canOperateAi() || state.aiInstalled === false;
+  $("wake-ai").textContent = state.sessionPendingAction === "resume" ? "Acordando…" : "Acordar";
   $("start-ai").disabled = busy || !canOperateAi() || state.aiInstalled === false;
   $("ai-sessions-toggle").disabled = busy || !canOperateAi();
-  $("ai-sessions").querySelectorAll(".session-item").forEach((button) => { button.disabled = busy || !canOperateAi(); });
+  $("ai-sessions").querySelectorAll(".session-card").forEach((card) => {
+    const restricted = card.dataset.mode === "unrestricted" && state.user?.role !== "admin";
+    card.querySelectorAll("button").forEach((button) => {
+      button.disabled = busy || !canOperateAi() || ((button.textContent === "Acordar" && card.dataset.status === "archived") || (button.textContent !== "Abrir" && restricted));
+    });
+  });
   $("retry-ai").disabled = busy;
   $("new-ai-session").disabled = busy || !canOperateAi() || state.aiInstalled !== true;
   $("new-ai-session").textContent = state.aiCreating ? "Iniciando conversa…" : "Iniciar conversa";
@@ -1007,7 +1028,7 @@ function updateAiConversation() {
   });
   $("cancel-ai-setup").disabled = state.aiCreating;
   $("stop-ai").disabled = state.aiStopping || state.aiCreating || state.sessionOperationPending || !canOperateAi() || ["sleeping", "starting"].includes(state.aiPhase);
-  $("stop-ai").textContent = state.aiStopping ? "Encerrando…" : "Encerrar OpenCode";
+  $("stop-ai").textContent = state.aiStopping ? "Desligando…" : "Desligar";
   $("refresh-ai-history").disabled = !session || !canOperateAi() || state.aiInstalled === false
     || state.aiLoading || state.aiCreating || state.aiSelecting || state.aiManualSync || state.aiStopping;
   $("refresh-ai-history").textContent = state.aiManualSync ? "Atualizando…" : "Atualizar histórico";
@@ -1131,7 +1152,8 @@ function setSelectedAiMode(mode) {
 
 async function confirmationFor(mode) {
   if (mode !== "unrestricted") return null;
-  if (state.unrestrictedConfirmed) return "I understand OpenCode will have full control";
+  if (state.user?.role !== "admin") throw new Error("O modo Unrestricted exige administrador.");
+  if (state.unrestrictedAutoConfirm) return "I understand OpenCode will have full control";
   const phrase = window.prompt('Digite exatamente "I understand OpenCode will have full control" para ativar controle irrestrito:');
   if (phrase !== "I understand OpenCode will have full control") throw new Error("Confirmação irrestrita não corresponde.");
   return phrase;
@@ -1143,13 +1165,17 @@ function startAi() {
 
 async function wakeAi() {
   if ($("wake-ai").disabled) return;
-  if (state.aiSession) {
-    await sessionOperation("resume");
-  } else if (state.aiSessions.length) {
+  if (state.aiSessions.length) {
     setAiSessionsDrawer(true);
   } else {
     setAiSetup(true);
   }
+}
+
+async function wakeAiSession(session) {
+  if (state.sessionOperationPending || state.aiSelecting || state.aiResponding) return;
+  if (state.aiSession?.id !== session.id) await selectAiSession(session);
+  if (state.aiSession?.id === session.id) await sessionOperation("resume");
 }
 
 async function stopAi() {
@@ -1164,6 +1190,9 @@ async function stopAi() {
     state.pendingQuestions = [];
     renderPendingQuestion();
     setAiResponding(false);
+    const sessions = await request("/api/v1/opencode/sessions");
+    renderAiSessions(sessions);
+    if (state.aiSession) state.aiSession = sessions.find((session) => session.id === state.aiSession.id) || null;
     renderAiStatus(await request("/api/v1/opencode/status"));
     toast("OpenCode encerrado. Histórico preservado.");
   } catch (error) { setAiError(`Não foi possível encerrar o processo. ${error.message}`); }
@@ -1191,7 +1220,6 @@ async function createAiSession() {
         confirmation,
       }),
     });
-    if (mode === "unrestricted") state.unrestrictedConfirmed = true;
     state.aiSession = session;
     $("chat-prompt").value = "";
     $("ai-conversation-name").value = "";
@@ -1795,6 +1823,14 @@ $("ai-show-unrestricted-warning").addEventListener("change", (event) => {
     toast("Preferência de aviso salva neste navegador.");
   } catch (_) { toast("Preferência aplicada nesta página; o navegador não permitiu salvá-la.", true); }
 });
+$("ai-unrestricted-auto-confirm").addEventListener("change", (event) => {
+  if (state.user?.role !== "admin") { event.target.checked = false; return; }
+  state.unrestrictedAutoConfirm = event.target.checked;
+  try {
+    localStorage.setItem(`carobaguard.unrestrictedAutoConfirm.${state.user.id}`, String(state.unrestrictedAutoConfirm));
+    toast(state.unrestrictedAutoConfirm ? "Confirmação automática ativada neste navegador." : "Confirmação manual ativada.");
+  } catch (_) { toast("Preferência aplicada nesta página; o navegador não permitiu salvá-la.", true); }
+});
 $("ai-session-search").addEventListener("input", () => renderAiSessions(state.aiSessions));
 $("chat-prompt").addEventListener("input", updateAiConversation);
 $("chat-prompt").addEventListener("keydown", (event) => {
@@ -1858,30 +1894,44 @@ async function loadSessionWorkspace() {
   finally { state.sessionWorkspaceLoading = false; }
 }
 
-async function sessionOperation(action, title = null) {
-  const session = state.aiSession;
+async function sessionOperation(action, title = null, target = null) {
+  const session = target || state.aiSession;
   if (!session || state.sessionOperationPending || !canOperateAi()) return;
-  if (["delete", "archive", "stop"].includes(action) && !window.confirm(`${action}: ${session.title}? O Audit Log e os arquivos do workspace serão preservados.`)) return;
+  if (session.permission_mode === "unrestricted" && state.user?.role !== "admin") return;
+  if (["delete", "archive", "stop"].includes(action)) {
+    const question = action === "delete"
+      ? `Excluir a sessão "${session.title}"? Se estiver ativa, ela será parada antes. Os arquivos do projeto, o histórico nativo do OpenCode e o Audit Log serão preservados.`
+      : `${action === "stop" ? "Parar" : "Arquivar"} a sessão "${session.title}"? O Audit Log e os arquivos do workspace serão preservados.`;
+    if (!window.confirm(question)) return;
+  }
   state.sessionOperationPending = true;
   state.sessionPendingAction = action;
   setAiError();
   updateAiConversation();
   try {
     if (action === "delete") {
+      if (["ready", "starting", "stopping"].includes(session.status)) {
+        await request(`/api/v1/opencode/sessions/${encodeURIComponent(session.id)}/actions`, { method: "POST", body: JSON.stringify({ action: "stop" }) });
+      }
       await request(`/api/v1/opencode/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
-      state.aiSession = null;
-      clearChatMessages();
-      $("session-workspace-status").textContent = "Sessão excluída. Histórico nativo do OpenCode preservado.";
-      $("session-git").textContent = "";
-      $("session-output").textContent = "";
-      $("session-timeline").replaceChildren();
+      state.aiDrafts.delete(session.id);
+      if (state.aiSession?.id === session.id) {
+        state.aiSession = null;
+        clearChatMessages();
+        $("session-workspace-status").textContent = "Sessão excluída. Histórico nativo do OpenCode preservado.";
+        $("session-git").textContent = "";
+        $("session-output").textContent = "";
+        $("session-timeline").replaceChildren();
+      }
     } else {
       const confirmation = action === "resume" ? await confirmationFor(session.permission_mode) : null;
       const updated = await request(`/api/v1/opencode/sessions/${encodeURIComponent(session.id)}/actions`, { method: "POST", body: JSON.stringify({ action, title, confirmation }) });
       if (state.aiSession?.id === session.id) state.aiSession = updated;
       if (["sleep", "stop", "archive"].includes(action)) { resetAiRequestState(); setAiResponding(false); }
-      await loadSessionWorkspace();
-      await reconcileAiHistory();
+      if (state.aiSession?.id === session.id) {
+        await loadSessionWorkspace();
+        await reconcileAiHistory();
+      }
     }
     renderAiSessions(await request("/api/v1/opencode/sessions"));
     renderAiStatus(await request("/api/v1/opencode/status"));
